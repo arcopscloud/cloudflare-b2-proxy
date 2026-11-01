@@ -1,178 +1,190 @@
-//
-// Proxy Backblaze S3 compatible API requests, sending notifications to a webhook
-//
-// Adapted from https://github.com/obezuk/worker-signed-s3-template
-//
-import { AwsClient } from 'aws4fetch'
+import { AwsClient } from 'aws4fetch';
 
-// Extract the region from the endpoint
+// Global CORS headers for browser compatibility
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': '*',
+};
 
-const endpointRegex = /^s3\.([a-zA-Z0-9-]+)\.backblazeb2\.com$/;
-const [ , aws_region] = AWS_S3_ENDPOINT.match(endpointRegex);
-
-const aws = new AwsClient({
-    "accessKeyId": AWS_ACCESS_KEY_ID,
-    "secretAccessKey": AWS_SECRET_ACCESS_KEY,
-    "service": "s3",
-    "region": aws_region,
-});
-
-const unsignedError =
-`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+const unsignedError = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Error>
-    <Code>AccessDenied</Code>
-    <Message>Unauthenticated requests are not allowed for this api</Message>
+  <Code>AccessDenied</Code>
+  <Message>Unauthenticated requests are not allowed for private paths.</Message>
 </Error>`;
 
-// Could add more detail regarding the specific error, but this enough for now
-const validationError = 
-`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+const validationError = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/">
   <Error>
     <Type>Sender</Type>
     <Code>SignatureDoesNotMatch</Code>
     <Message>Signature validation failed.</Message>
   </Error>
-  <RequestId>0300D815-9252-41E5-B587-F189759A21BF</RequestId>
 </ErrorResponse>`;
 
-
-addEventListener('fetch', function(event) {
-    event.respondWith(handleRequest(event))
-});
-
-
-// These headers appear in the request, but are not passed upstream
-const UNSIGNABLE_HEADERS = [
-    'x-forwarded-proto',
-    'x-real-ip',
-]
-
-
-// Filter out cf-* and any other headers we don't want to include in the signature
+// Filter out Cloudflare and hop-by-hop headers that break B2 signatures
 function filterHeaders(headers) {
-    return Array.from(headers.entries())
-      .filter(pair => !UNSIGNABLE_HEADERS.includes(pair[0]) && !pair[0].startsWith('cf-'));
+  const STRIP = ['x-forwarded-proto', 'x-real-ip', 'host', 'cf-ray', 'cf-connecting-ip', 'cf-ipcountry', 'cf-visitor'];
+  const filtered = new Headers();
+  for (const [k, v] of headers.entries()) {
+    const lower = k.toLowerCase();
+    if (!STRIP.includes(lower) && !lower.startsWith('cf-')) {
+      filtered.set(k, v);
+    }
+  }
+  return filtered;
 }
 
+// AWS SigV4 verification for Private S3 API calls
+async function verifySignature(request, aws, expectedKey) {
+  const authorization = request.headers.get('Authorization');
+  if (!authorization) throw new Error('MISSING');
 
-function SignatureMissingException() {}
+  const re = /^AWS4-HMAC-SHA256 Credential=([^,]+),\s*SignedHeaders=([^,]+),\s*Signature=(.+)$/;
+  const match = authorization.match(re);
+  if (!match) throw new Error('INVALID');
 
+  const [ , credential, signedHeaders, signature] = match;
+  const keyId = credential.split('/')[0];
+  if (keyId !== expectedKey) throw new Error('INVALID');
 
-function SignatureInvalidException() {}
+  const datetime = request.headers.get('x-amz-date');
+  const headersToSign = {};
+  signedHeaders.split(';').forEach((k) => {
+    headersToSign[k] = request.headers.get(k);
+  });
 
+  const signedRequest = await aws.sign(request.url, {
+    method: request.method,
+    headers: headersToSign,
+    body: request.method !== 'GET' && request.method !== 'HEAD' ? request.clone().body : null,
+    aws: { datetime, allHeaders: true },
+  });
 
-// Verify the signature on the incoming request
-async function verifySignature(request) {
-    const authorization = request.headers.get('Authorization');
-    if (!authorization) {
-        throw new SignatureMissingException();
+  const signedMatch = signedRequest.headers.get('Authorization').match(re);
+  if (!signedMatch || signature !== signedMatch[3]) {
+    throw new Error('INVALID');
+  }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    // 1. CORS Preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
     }
 
-    // Parse the AWS V4 signature value
-    const re = /^AWS4-HMAC-SHA256 Credential=([^,]+),\s*SignedHeaders=([^,]+),\s*Signature=(.+)$/;
-    let [ , credential, signedHeaders, signature] = authorization.match(re);
+    const url = new URL(request.url);
+    const pathname = url.pathname;
 
-    credential = credential.split('/');
-    signedHeaders = signedHeaders.split(';');
-
-    // Verify that the request was signed with the expected key
-    if (credential[0] != AWS_ACCESS_KEY_ID) {
-        throw new SignatureInvalidException();
+    // 2. Health check for root URL
+    if (pathname === '/' || pathname === '') {
+      return new Response(JSON.stringify({ status: 'online', service: 'BuckStream S3 Broker', region: 'us-east' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
     }
 
-    // Use the timestamp from the incoming signature
-    const datetime = request.headers.get('x-amz-date');
+    // 3. Clean endpoint & auto-detect region (e.g. s3.us-east-005.backblazeb2.com)
+    const rawEndpoint = (env.AWS_S3_ENDPOINT || 's3.us-east-005.backblazeb2.com')
+      .replace(/^https?:\/\//, '')
+      .replace(/\/.*$/, '')
+      .trim();
 
-    // Extract the headers that we want from the complete set of incoming headers
-    const headersToSign = signedHeaders
-        .map(key => ({
-            name: key, 
-            value: request.headers.get(key) 
-        }))
-        .reduce((obj, item) => (obj[item.name] = item.value, obj), {});
+    const matchRegion = rawEndpoint.match(/^s3\.([a-zA-Z0-9-]+)\.backblazeb2\.com$/);
+    const region = matchRegion ? matchRegion[1] : 'us-east-1';
 
-    const signedRequest = await aws.sign(request.url, {
-        method: request.method,
-        headers: headersToSign,
-        body: request.body,
-        aws: { datetime: datetime, allHeaders:true }
+    const aws = new AwsClient({
+      accessKeyId: env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+      service: 's3',
+      region: region,
     });
 
-    // All we need is the signature component of the Authorization header
-    const [ , , , generatedSignature] = signedRequest.headers.get('Authorization').match(re);
+    // 4. Check if request is a Public CDN route (/public/* or /<bucket>/public/*)
+    const isPublicRoute =
+      (request.method === 'GET' || request.method === 'HEAD') &&
+      (pathname.startsWith('/public/') || pathname.includes('/public/'));
 
-    if (signature !== generatedSignature) {
-        throw new SignatureInvalidException();
+    // Check Cloudflare Edge Cache for Public Downloads
+    const cache = caches.default;
+    if (isPublicRoute) {
+      const cached = await cache.match(request);
+      if (cached) return cached;
     }
-}
 
+    // 5. Build Upstream B2 URL
+    const upstreamUrl = new URL(request.url);
+    upstreamUrl.hostname = rawEndpoint;
 
-// Where the magic happens...
-async function handleRequest(event) {
-    const request = event.request;
+    // If request is directly /public/... and DEFAULT_BUCKET is provided, route into bucket
+    if (pathname.startsWith('/public/') && env.DEFAULT_BUCKET) {
+      upstreamUrl.pathname = `/${env.DEFAULT_BUCKET}${pathname}`;
+    }
 
-    // Set upstream target hostname.
-    var url = new URL(request.url);
-    url.hostname = AWS_S3_ENDPOINT;
+    // 6. Enforce AWS SigV4 security for private endpoints
+    if (!isPublicRoute) {
+      try {
+        await verifySignature(request, aws, env.AWS_ACCESS_KEY_ID);
+      } catch (err) {
+        return new Response(err.message === 'MISSING' ? unsignedError : validationError, {
+          status: 403,
+          headers: { 'Content-Type': 'application/xml', ...corsHeaders },
+        });
+      }
+    }
 
-    // Only handle requests signed by our configured key.
+    // 7. Filter headers and sign outgoing request to B2
+    const outgoingHeaders = filterHeaders(request.headers);
+    const signedRequest = await aws.sign(upstreamUrl.toString(), {
+      method: request.method,
+      headers: outgoingHeaders,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : null,
+    });
+
+    // 8. Fetch from Backblaze B2 (Bandwidth Alliance: $0 Egress)
+    let response;
     try {
-        await verifySignature(request);
-    } catch (e) {
-        // Signature is missing or bad - deny the request
-        return new Response(
-            (e instanceof SignatureMissingException) ? 
-                unsignedError : 
-                validationError,
-            {
-                status: 403,
-                headers: {
-                    'Content-Type': 'application/xml',
-                    'Cache-Control': 'max-age=0, no-cache, no-store'
-                }
-            });
+      response = await fetch(signedRequest);
+    } catch (fetchErr) {
+      return new Response(JSON.stringify({ error: 'Failed to reach upstream B2', details: fetchErr.message }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json', ...corsHeaders },
+      });
     }
 
-    // Certain headers appear in the incoming request but are
-    // removed from the outgoing request. If they are in the
-    // signed headers, B2 can't validate the signature.
-    const headers = filterHeaders(request.headers);
+    // 9. Reconstruct Response with CORS headers
+    response = new Response(response.body, response);
+    for (const [k, v] of Object.entries(corsHeaders)) {
+      response.headers.set(k, v);
+    }
 
-    // Sign the new request
-    var signedRequest = await aws.sign(url, {
-        method: request.method,
-        headers: headers,
-        body: request.body
-    });
+    // 10. Cache ONLY successful 200 responses for public routes (avoid 206 Partial Content crash)
+    if (isPublicRoute && response.status === 200) {
+      response.headers.set('Cache-Control', 'public, max-age=604800, s-maxage=604800');
+      try {
+        ctx.waitUntil(cache.put(request, response.clone()));
+      } catch (_) {}
+    }
 
-    // Send the signed request to B2 and wait for the upstream response
-    const response = await fetch(signedRequest);
-
-    if (WEBHOOK_URL) {
-        // Convert content length from a string to an integer
-        let contentLength = request.headers.get('content-length');
-        contentLength = contentLength ? parseInt(contentLength) : null;
-
-        // This will fire the fetch to the webhook asynchronously so the
-        // response is not delayed.
-        event.waitUntil(
-            fetch(WEBHOOK_URL, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    contentLength: contentLength,
-                    contentType: request.headers.get('content-type'),
-                    method: request.method,
-                    signatureTimestamp: request.headers.get('x-amz-date'),
-                    status: response.status,
-                    url: response.url
-                })
-            })
-        );        
+    // 11. Async Webhook Trigger (Only if configured)
+    if (env.WEBHOOK_URL && env.WEBHOOK_URL.startsWith('http')) {
+      ctx.waitUntil(
+        fetch(env.WEBHOOK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            method: request.method,
+            path: pathname,
+            status: response.status,
+            isPublic: isPublicRoute,
+            contentLength: request.headers.get('content-length'),
+            timestamp: new Date().toISOString(),
+          }),
+        }).catch(() => {})
+      );
     }
 
     return response;
-}
+  },
+};
